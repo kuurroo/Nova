@@ -1,0 +1,145 @@
+# nova/quality.py
+from __future__ import annotations
+from typing import Literal, TypedDict, Optional, Dict
+import re
+
+Verbosity = Literal["brief", "normal", "deep"]
+OutFormat = Literal["plain", "bullets", "steps", "code", "mixed"]
+
+class ResponseMode(TypedDict):
+    pass
+
+def _strip_leading_markers(line: str) -> str:
+    return re.sub(r"^\s*(?:[-*•]\s*|\d+[.)]\s*)", "", line).strip()
+
+
+    verbosity: Verbosity
+    format: OutFormat
+    max_words: Optional[int]  # None = don't force word cap
+
+_WORDY = re.compile(r'\b(\d+)\s*(word|words|token|tokens|sentence|sentences|paragraph|paragraphs)\b', re.I)
+
+def _infer_word_caps(q: str) -> Optional[int]:
+    # Accept “N words”, “N tokens”, “N sentences/paragraphs” (map 1 sentence≈25 words, 1 paragraph≈120 words)
+    m = _WORDY.search(q or "")
+    if not m: return None
+    n = int(m.group(1)); unit = m.group(2).lower()
+    if "word" in unit: return max(n, 1)
+    if "token" in unit: return max(int(n * 0.75), 1)  # crude tokens→words
+    if "sentence" in unit: return max(n * 25, 20)
+    if "paragraph" in unit: return max(n * 120, 80)
+    return None
+
+def _format_hint(q: str) -> Optional[OutFormat]:
+    ql = q.lower()
+    if any(k in ql for k in ("bullet", "list", "•", "- ")): return "bullets"
+    if any(k in ql for k in ("step", "procedure", "walk me through")): return "steps"
+    if any(k in ql for k in ("code", "snippet", "example function", "class example")): return "code"
+    if any(k in ql for k in ("tl;dr", "tldr", "summary")): return "plain"
+    return None
+
+def _verbosity_hint(q: str) -> Optional[Verbosity]:
+    ql = q.lower()
+    if any(k in ql for k in ("one word", "single word", "brief", "short", "tl;dr", "tldr")): return "brief"
+    if any(k in ql for k in ("deep dive", "explain why", "compare", "tradeoff", "pros and cons", "in depth")): return "deep"
+    return None
+
+class AnswerQuality:
+    """Local reply shaping: infer desired format/length and re-render without another model call."""
+
+    def decide_response_mode(self, q: str) -> ResponseMode:
+        ql = q.lower().strip()
+        fmt = _format_hint(ql)
+        verb = _verbosity_hint(ql)
+
+        if not verb:
+            if len(ql.split()) <= 5:
+                verb = "brief"
+            elif any(k in ql for k in ["explain", "why", "compare", "tradeoff", "pros", "cons"]):
+                verb = "deep"
+            else:
+                verb = "normal"
+
+        if not fmt:
+            if any(k in ql for k in ["steps", "checklist", "procedure"]):
+                fmt = "steps"
+            elif any(k in ql for k in ["bullet", "list"]):
+                fmt = "bullets"
+            elif any(k in ql for k in ["code", "snippet", "example"]):
+                fmt = "code"
+            else:
+                fmt = "plain"
+
+        return {"verbosity": verb, "format": fmt, "max_words": _infer_word_caps(ql)}
+
+    def merge_with_defaults(self, mode: ResponseMode, defaults: Optional[Dict] = None) -> ResponseMode:
+        if not defaults: return mode
+        out: ResponseMode = {
+            "verbosity": mode["verbosity"],
+            "format": mode["format"],
+            "max_words": mode.get("max_words"),
+        }  # type: ignore
+        if out.get("max_words") is None and defaults.get("max_words") is not None:
+            out["max_words"] = defaults.get("max_words")  # type: ignore
+        return out
+
+    def render(self, text: str, mode: ResponseMode) -> str:
+        fmt = mode["format"]
+        t = (text or "").strip()
+
+        if fmt == "bullets":
+            lines = [ln for ln in (ln.strip() for ln in t.splitlines()) if ln]
+            lines = [_strip_leading_markers(ln) for ln in lines]
+            t = "\n".join(f"- {ln}" for ln in lines)
+        elif fmt == "steps":
+            lines = [ln for ln in (ln.strip() for ln in t.splitlines()) if ln]
+            lines = [_strip_leading_markers(ln) for ln in lines]
+            t = "\n".join(f"{i+1}. {ln}" for i, ln in enumerate(lines))
+        elif fmt == "code":
+            if "```" in t:
+                # extract first fenced block
+                m = re.search(r"```[a-zA-Z0-9_+-]*\n([\s\S]*?)```", t)
+                if m:
+                    t = m.group(0)
+                else:
+                    t = f"```\n{t}\n```"
+            else:
+                t = f"```\n{t}\n```"
+        # plain/mixed → leave text as-is
+
+        # word cap last (don’t break code fences)
+        cap = mode.get("max_words")
+        if cap and cap > 0 and "```" not in t:
+            words = t.split()
+            if len(words) > cap:
+                t = " ".join(words[:cap]).rstrip() + " …"
+        return t
+
+    def concision(self, text: str, mode: ResponseMode) -> str:
+        if mode["verbosity"] != "brief": return text
+        first = text.strip().split("\n", 1)[0]
+        if len(first.split()) > 20:
+            words = first.split()
+            return " ".join(words[:20]) + " …"
+        return first
+
+    def safety_wrap(self, text: str, q: str) -> str:
+        factual = ("what is", "who is", "where is", "when did", "how does", "what are", "define")
+        if any(k in q.lower() for k in factual):
+            if "Based on my knowledge" not in text and "As of" not in text:
+                return f"Based on my knowledge, {text}"
+        return text
+
+# convenience one-shot
+def apply(text: str, q: str, defaults: Optional[Dict]=None) -> str:
+    aq = AnswerQuality()
+    ql = (q or "").lower()
+    mode = aq.decide_response_mode(q)
+    # explicit directives? (format/verbosity/word-cap)
+    has_fmt = _format_hint(ql) is not None
+    has_verb = _verbosity_hint(ql) is not None
+    has_cap = _infer_word_caps(ql) is not None
+    if not (has_fmt or has_verb or has_cap):
+        mode = aq.merge_with_defaults(mode, defaults)
+    shaped = aq.render(text, mode)
+    return aq.concision(shaped, mode)
